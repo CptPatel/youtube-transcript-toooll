@@ -1,0 +1,572 @@
+ here’s a complete, working FastAPI backend you can drop into a repo and point your Next.js frontend at. (feel free to improve)
+
+I’ll give you:
+
+1. folder structure
+2. every `.py` file
+3. `requirements.txt`
+4. how to run
+
+You can literally copy–paste these.
+
+---
+
+## 1. Folder structure
+
+```text
+yt-transcript-backend/
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── routes.py
+│   │   └── models.py
+│   ├── services/
+│   │   ├── __init__.py
+│   │   └── transcript_service.py
+│   ├── exporters/
+│   │   ├── __init__.py
+│   │   ├── txt_exporter.py
+│   │   ├── srt_exporter.py
+│   │   └── vtt_exporter.py
+│   └── storage/
+│       ├── __init__.py
+│       └── local_storage.py
+├── exports/          # will be created at runtime
+└── requirements.txt
+```
+
+You can change the root folder name, but keep the internal paths.
+
+---
+
+## 2. `requirements.txt`
+
+```text
+fastapi
+uvicorn[standard]
+youtube-transcript-api
+python-multipart
+pydantic
+```
+
+---
+
+## 3. `app/__init__.py`
+
+```python
+# empty is fine
+```
+
+---
+
+## 4. `app/main.py`
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from app.api.routes import router as api_router
+
+app = FastAPI(
+    title="YouTube Transcript Downloader API",
+    version="0.1.0",
+    description="Backend for downloading YouTube transcripts in multiple formats."
+)
+
+# CORS (open for now; lock later)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# API routes
+app.include_router(api_router, prefix="/api")
+
+# static files for downloads
+app.mount("/files", StaticFiles(directory="exports"), name="files")
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "YouTube Transcript Downloader API"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+```
+
+---
+
+## 5. `app/api/__init__.py`
+
+```python
+# empty
+```
+
+---
+
+## 6. `app/api/models.py`
+
+These are the request/response Pydantic models.
+
+```python
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, HttpUrl
+
+
+class TranscriptRequest(BaseModel):
+    url: HttpUrl
+    lang: Optional[str] = None
+    formats: List[str] = ["txt", "srt", "vtt", "json"]
+
+
+class TranscriptResponse(BaseModel):
+    success: bool
+    video_id: Optional[str] = None
+    source_url: Optional[str] = None
+    language_used: Optional[str] = None
+    available_languages: Optional[List[str]] = None
+    transcript_preview: Optional[str] = None
+    download_urls: Optional[Dict[str, str]] = None
+    error: Optional[str] = None
+
+
+class BulkTranscriptRequest(BaseModel):
+    urls: List[HttpUrl]
+    lang: Optional[str] = None
+    formats: List[str] = ["txt", "srt", "vtt", "json"]
+
+
+class BulkItemResponse(BaseModel):
+    url: str
+    video_id: Optional[str] = None
+    success: bool
+    download_urls: Optional[Dict[str, str]] = None
+    error: Optional[str] = None
+
+
+class BulkTranscriptResponse(BaseModel):
+    success: bool
+    results: List[BulkItemResponse]
+```
+
+---
+
+## 7. `app/api/routes.py`
+
+This is where the `/api/transcript` and `/api/bulk` live.
+
+```python
+from fastapi import APIRouter, HTTPException
+from typing import List
+
+from app.api.models import (
+    TranscriptRequest,
+    TranscriptResponse,
+    BulkTranscriptRequest,
+    BulkTranscriptResponse,
+    BulkItemResponse,
+)
+
+from app.services.transcript_service import (
+    process_single_transcript,
+    process_single_transcript_safe,
+)
+
+router = APIRouter()
+
+
+@router.post("/transcript", response_model=TranscriptResponse)
+def get_transcript(payload: TranscriptRequest):
+    try:
+        result = process_single_transcript(
+            url=str(payload.url),
+            lang=payload.lang,
+            formats=payload.formats
+        )
+        return TranscriptResponse(**result)
+    except HTTPException as e:
+        # pass through FastAPI errors
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/bulk", response_model=BulkTranscriptResponse)
+def get_bulk_transcripts(payload: BulkTranscriptRequest):
+    results: List[BulkItemResponse] = []
+
+    for url in payload.urls:
+        result = process_single_transcript_safe(
+            url=str(url),
+            lang=payload.lang,
+            formats=payload.formats
+        )
+        results.append(BulkItemResponse(**result))
+
+    return BulkTranscriptResponse(success=True, results=results)
+```
+
+---
+
+## 8. `app/services/__init__.py`
+
+```python
+# empty
+```
+
+---
+
+## 9. `app/services/transcript_service.py`
+
+This is the core logic: parse URL → get transcript → export → return download links.
+
+```python
+import os
+import re
+from typing import List, Optional, Dict, Any
+
+from fastapi import HTTPException
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+
+from app.exporters.txt_exporter import transcript_to_txt
+from app.exporters.srt_exporter import transcript_to_srt
+from app.exporters.vtt_exporter import transcript_to_vtt
+from app.storage.local_storage import save_text_file, save_json_file
+
+
+YOUTUBE_ID_REGEXES = [
+    r"(?:v=|vi=)([0-9A-Za-z_-]{11})",              # https://www.youtube.com/watch?v=VIDEOID
+    r"(?:https?://youtu\.be/)([0-9A-Za-z_-]{11})", # https://youtu.be/VIDEOID
+    r"(?:shorts/)([0-9A-Za-z_-]{11})",             # https://www.youtube.com/shorts/VIDEOID
+]
+
+
+def extract_video_id(url: str) -> str:
+    for pattern in YOUTUBE_ID_REGEXES:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    # fallback: sometimes params come after
+    # /watch?v=VIDEOID&...
+    if "watch?v=" in url:
+        vid = url.split("watch?v=")[1][:11]
+        if len(vid) == 11:
+            return vid
+    raise HTTPException(status_code=400, detail="Invalid or unsupported YouTube URL")
+
+
+def list_available_languages(video_id: str) -> List[str]:
+    transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+    langs = []
+    for t in transcripts:
+        langs.append(t.language_code)
+    return langs
+
+
+def fetch_transcript(video_id: str, lang: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Returns a dict:
+    {
+      "language_used": "en",
+      "available_languages": [...],
+      "transcript": [...]
+    }
+    """
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+    except (TranscriptsDisabled, VideoUnavailable) as e:
+        raise HTTPException(status_code=404, detail="Transcript not available for this video")
+
+    # collect all languages
+    available_langs = [t.language_code for t in transcript_list]
+
+    # choose which transcript to fetch
+    transcript_obj = None
+
+    # 1. user-requested language
+    if lang:
+        try:
+            transcript_obj = transcript_list.find_transcript([lang])
+        except NoTranscriptFound:
+            transcript_obj = None
+
+    # 2. try english
+    if transcript_obj is None:
+        try:
+            transcript_obj = transcript_list.find_transcript(["en", "en-US", "en-GB"])
+        except NoTranscriptFound:
+            transcript_obj = None
+
+    # 3. fallback: first available
+    if transcript_obj is None:
+        # just pick the first one
+        transcript_obj = list(transcript_list._manually_created_transcripts.values())[0] \
+            if transcript_list._manually_created_transcripts \
+            else list(transcript_list._generated_transcripts.values())[0]
+
+    # now fetch actual transcript
+    transcript_data = transcript_obj.fetch()
+
+    return {
+        "language_used": transcript_obj.language_code,
+        "available_languages": available_langs,
+        "transcript": transcript_data,
+    }
+
+
+def process_single_transcript(url: str, lang: Optional[str], formats: List[str]) -> Dict[str, Any]:
+    video_id = extract_video_id(url)
+
+    data = fetch_transcript(video_id, lang)
+
+    transcript_segments = data["transcript"]
+    language_used = data["language_used"]
+    available_languages = data["available_languages"]
+
+    # make sure exports dir exists
+    base_dir = os.path.join("exports", video_id)
+    os.makedirs(base_dir, exist_ok=True)
+
+    download_urls: Dict[str, str] = {}
+
+    # TXT
+    if "txt" in formats:
+        txt_content = transcript_to_txt(transcript_segments)
+        save_text_file(base_dir, "transcript.txt", txt_content)
+        download_urls["txt"] = f"/files/{video_id}/transcript.txt"
+
+    # SRT
+    if "srt" in formats:
+        srt_content = transcript_to_srt(transcript_segments)
+        save_text_file(base_dir, "transcript.srt", srt_content)
+        download_urls["srt"] = f"/files/{video_id}/transcript.srt"
+
+    # VTT
+    if "vtt" in formats:
+        vtt_content = transcript_to_vtt(transcript_segments)
+        save_text_file(base_dir, "transcript.vtt", vtt_content)
+        download_urls["vtt"] = f"/files/{video_id}/transcript.vtt"
+
+    # JSON (raw)
+    if "json" in formats:
+        save_json_file(base_dir, "transcript.json", transcript_segments)
+        download_urls["json"] = f"/files/{video_id}/transcript.json"
+
+    # preview
+    preview = " ".join([seg["text"] for seg in transcript_segments])[:300]
+
+    return {
+        "success": True,
+        "video_id": video_id,
+        "source_url": url,
+        "language_used": language_used,
+        "available_languages": available_languages,
+        "transcript_preview": preview,
+        "download_urls": download_urls,
+    }
+
+
+def process_single_transcript_safe(url: str, lang: Optional[str], formats: List[str]) -> Dict[str, Any]:
+    """
+    Safe wrapper for bulk calls — never raises, always returns a dict.
+    """
+    try:
+        result = process_single_transcript(url, lang, formats)
+        return {
+            "url": url,
+            "video_id": result["video_id"],
+            "success": True,
+            "download_urls": result["download_urls"],
+        }
+    except HTTPException as e:
+        return {
+            "url": url,
+            "video_id": None,
+            "success": False,
+            "error": e.detail,
+        }
+    except Exception as e:
+        return {
+            "url": url,
+            "video_id": None,
+            "success": False,
+            "error": str(e),
+        }
+```
+
+---
+
+## 10. `app/exporters/__init__.py`
+
+```python
+# empty
+```
+
+---
+
+## 11. `app/exporters/txt_exporter.py`
+
+```python
+from typing import List, Dict, Any
+
+
+def transcript_to_txt(segments: List[Dict[str, Any]]) -> str:
+    # simple join with newlines
+    lines = [seg["text"].strip() for seg in segments if seg.get("text")]
+    return "\n".join(lines)
+```
+
+---
+
+## 12. `app/exporters/srt_exporter.py`
+
+```python
+from typing import List, Dict, Any
+import math
+
+
+def seconds_to_srt_timestamp(seconds: float) -> str:
+    # SRT: HH:MM:SS,mmm
+    millis = int((seconds - int(seconds)) * 1000)
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
+
+
+def transcript_to_srt(segments: List[Dict[str, Any]]) -> str:
+    """
+    Convert transcript segments to SRT format.
+    """
+    srt_lines = []
+    for idx, seg in enumerate(segments, start=1):
+        start = seg["start"]
+        duration = seg.get("duration", 0)
+        end = start + duration
+
+        start_ts = seconds_to_srt_timestamp(start)
+        end_ts = seconds_to_srt_timestamp(end)
+
+        text = seg["text"].replace("\n", " ").strip()
+
+        srt_lines.append(str(idx))
+        srt_lines.append(f"{start_ts} --> {end_ts}")
+        srt_lines.append(text)
+        srt_lines.append("")  # blank line
+
+    return "\n".join(srt_lines)
+```
+
+---
+
+## 13. `app/exporters/vtt_exporter.py`
+
+```python
+from typing import List, Dict, Any
+
+
+def seconds_to_vtt_timestamp(seconds: float) -> str:
+    # VTT: HH:MM:SS.mmm
+    millis = int((seconds - int(seconds)) * 1000)
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02}:{minutes:02}:{secs:02}.{millis:03}"
+
+
+def transcript_to_vtt(segments: List[Dict[str, Any]]) -> str:
+    lines = ["WEBVTT", ""]
+    for seg in segments:
+        start = seg["start"]
+        duration = seg.get("duration", 0)
+        end = start + duration
+
+        start_ts = seconds_to_vtt_timestamp(start)
+        end_ts = seconds_to_vtt_timestamp(end)
+
+        text = seg["text"].replace("\n", " ").strip()
+
+        lines.append(f"{start_ts} --> {end_ts}")
+        lines.append(text)
+        lines.append("")
+
+    return "\n".join(lines)
+```
+
+---
+
+## 14. `app/storage/__init__.py`
+
+```python
+# empty
+```
+
+---
+
+## 15. `app/storage/local_storage.py`
+
+```python
+import os
+import json
+from typing import Any
+
+
+def save_text_file(base_dir: str, filename: str, content: str) -> None:
+    os.makedirs(base_dir, exist_ok=True)
+    filepath = os.path.join(base_dir, filename)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def save_json_file(base_dir: str, filename: str, data: Any) -> None:
+    os.makedirs(base_dir, exist_ok=True)
+    filepath = os.path.join(base_dir, filename)
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+```
+
+---
+
+## 16. How to run
+
+```bash
+# 1. create venv
+python -m venv .venv
+source .venv/bin/activate  # windows: .venv\Scripts\activate
+
+# 2. install deps
+pip install -r requirements.txt
+
+# 3. run
+python -m app.main
+# or
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Test it:
+
+```bash
+curl -X POST http://localhost:8000/api/transcript \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","formats":["txt","srt","vtt","json"]}'
+```
+
+You should get JSON back, and files in `./exports/<video_id>/...`
+
+---
+
+That’s the full backend. You can now point your frontend at:
+
+* `POST http://localhost:8000/api/transcript`
+* `POST http://localhost:8000/api/bulk`
+* and download from `/files/{video_id}/transcript.txt` etc.
